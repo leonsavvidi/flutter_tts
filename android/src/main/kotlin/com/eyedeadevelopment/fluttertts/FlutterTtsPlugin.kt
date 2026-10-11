@@ -55,6 +55,17 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private var queueMode: Int = TextToSpeech.QUEUE_FLUSH
     private var ttsStatus: Int? = null
     private var selectedEngine: String? = null
+
+    // What the app last chose, kept so a re-created TextToSpeech instance
+    // (engine process died, e.g. a Play Store update) can be restored: the
+    // new instance starts with the engine defaults.
+    private var chosenSpeechRate: Float? = null
+    private var chosenPitch: Float? = null
+    private var chosenVoice: HashMap<String?, String>? = null
+
+    // True while a speak that failed on a live-looking connection is being
+    // retried on a freshly re-created instance; a second failure is final.
+    private var speakRebindAttempted = false
     private var engineResult: Result? = null
     private var parcelFileDescriptor: ParcelFileDescriptor? = null
     private var audioManager: AudioManager? = null
@@ -214,17 +225,15 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         }
     }
 
-    private val onInitListenerWithCallback: TextToSpeech.OnInitListener =
-        TextToSpeech.OnInitListener { status ->
-            // Handle pending method calls (sent while TTS was initializing)
-            synchronized(this@FlutterTtsPlugin) {
-                ttsStatus = status
-                for (call in pendingMethodCalls) {
-                    call.run()
-                }
-                pendingMethodCalls.clear()
-            }
-
+    /**
+     * Shared tail of both init listeners: on success, hook the utterance
+     * listener, pick the default locale and re-apply any voice / rate / pitch
+     * the app had chosen (a re-created instance has forgotten them); then
+     * replay the calls parked while the engine was (re)initializing.
+     */
+    private fun completeInit(status: Int) {
+        synchronized(this@FlutterTtsPlugin) {
+            ttsStatus = status
             if (status == TextToSpeech.SUCCESS) {
                 tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
                 try {
@@ -237,7 +246,23 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 } catch (e: IllegalArgumentException) {
                     Log.e(tag, "getDefaultLocale: " + e.message)
                 }
+                restoreEngineSettings()
+            } else {
+                Log.e(tag, "Failed to initialize TextToSpeech with status: $status")
+            }
+            // Handle pending method calls (sent while TTS was initializing)
+            val calls = ArrayList(pendingMethodCalls)
+            pendingMethodCalls.clear()
+            for (call in calls) {
+                call.run()
+            }
+        }
+    }
 
+    private val onInitListenerWithCallback: TextToSpeech.OnInitListener =
+        TextToSpeech.OnInitListener { status ->
+            completeInit(status)
+            if (status == TextToSpeech.SUCCESS) {
                 engineResult!!.success(1)
             } else {
                 engineResult!!.error("TtsError","Failed to initialize TextToSpeech with status: $status", null)
@@ -246,32 +271,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         }
 
     private val onInitListenerWithoutCallback: TextToSpeech.OnInitListener =
-        TextToSpeech.OnInitListener { status ->
-            // Handle pending method calls (sent while TTS was initializing)
-            synchronized(this@FlutterTtsPlugin) {
-                ttsStatus = status
-                for (call in pendingMethodCalls) {
-                    call.run()
-                }
-                pendingMethodCalls.clear()
-            }
-
-            if (status == TextToSpeech.SUCCESS) {
-                tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
-                try {
-                    val locale: Locale = tts!!.defaultVoice.locale
-                    if (isLanguageAvailable(locale)) {
-                        tts!!.language = locale
-                    }
-                } catch (e: NullPointerException) {
-                    Log.e(tag, "getDefaultLocale: " + e.message)
-                } catch (e: IllegalArgumentException) {
-                    Log.e(tag, "getDefaultLocale: " + e.message)
-                }
-            } else {
-                Log.e(tag, "Failed to initialize TextToSpeech with status: $status")
-            }
-        }
+        TextToSpeech.OnInitListener { status -> completeInit(status) }
 
     override fun onMethodCall(call: MethodCall, result: Result) {
         // If TTS is still loading
@@ -310,12 +310,24 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 }
                 val b = speak(text, focus)
                 if (!b) {
+                    if (speakRebindAttempted) {
+                        // The retry on a freshly re-created instance failed
+                        // too: report it instead of parking the call forever
+                        // (a parked call that never runs leaves the Dart
+                        // future unresolved).
+                        speakRebindAttempted = false
+                        invokeMethod("speak.onError", "Error from TextToSpeech (speak) - engine unavailable")
+                        result.success(0)
+                        return
+                    }
+                    speakRebindAttempted = true
                     synchronized(this@FlutterTtsPlugin) {
                         val suspendedCall = Runnable { onMethodCall(call, result) }
                         pendingMethodCalls.add(suspendedCall)
                     }
                     return
                 }
+                speakRebindAttempted = false
                 // Only use await speak completion if queueMode is set to QUEUE_FLUSH
                 if (awaitSpeakCompletion && queueMode == TextToSpeech.QUEUE_FLUSH) {
                     speaking = true
@@ -461,7 +473,24 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     private fun setSpeechRate(rate: Float) {
+        chosenSpeechRate = rate
         tts!!.setSpeechRate(rate)
+    }
+
+    /** Re-applies the app's voice / rate / pitch to a freshly created instance. */
+    private fun restoreEngineSettings() {
+        chosenSpeechRate?.let { tts!!.setSpeechRate(it) }
+        chosenPitch?.let { tts!!.setPitch(it) }
+        chosenVoice?.let { voice ->
+            for (ttsVoice in tts!!.voices) {
+                if (ttsVoice.name == voice["name"] &&
+                    ttsVoice.locale.toLanguageTag() == voice["locale"]
+                ) {
+                    tts!!.voice = ttsVoice
+                    break
+                }
+            }
+        }
     }
 
     private fun isLanguageAvailable(locale: Locale?): Boolean {
@@ -517,6 +546,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                     .toLanguageTag() == voice["locale"]
             ) {
                 tts!!.voice = ttsVoice
+                chosenVoice = voice
                 result.success(1)
                 return
             }
@@ -527,6 +557,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
     private fun clearVoice(result: Result) {
         tts!!.voice = tts!!.defaultVoice
+        chosenVoice = null
         result.success(1)
     }
 
@@ -542,6 +573,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
     private fun setPitch(pitch: Float, result: Result) {
         if (pitch in (0.5f..2.0f)) {
+            chosenPitch = pitch
             tts!!.setPitch(pitch)
             result.success(1)
         } else {
@@ -669,7 +701,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 requestAudioFocus()
             }
 
-            if (silencems > 0) {
+            val ok = if (silencems > 0) {
                 tts!!.playSilentUtterance(
                     silencems.toLong(),
                     TextToSpeech.QUEUE_FLUSH,
@@ -679,11 +711,30 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             } else {
                 tts!!.speak(text, queueMode, bundle, uuid) == 0
             }
+            // The reflection check above cannot see a binding that died
+            // (hidden-API restrictions): speak() then fails with "not bound
+            // to TTS engine" on a connection that looks usable. Treat any
+            // failed speak as a dead binding and re-create the instance.
+            if (!ok) recreateTts()
+            ok
         } else {
-            ttsStatus = null
-            tts = TextToSpeech(context, onInitListenerWithoutCallback, selectedEngine)
+            recreateTts()
             false
         }
+    }
+
+    /**
+     * Replaces the TextToSpeech instance. Calls made meanwhile are parked
+     * (ttsStatus == null) and replayed by [completeInit] once it is ready.
+     */
+    private fun recreateTts() {
+        ttsStatus = null
+        try {
+            tts?.shutdown()
+        } catch (e: Exception) {
+            Log.e(tag, "shutdown of the dead TextToSpeech failed: " + e.message)
+        }
+        tts = TextToSpeech(context, onInitListenerWithoutCallback, selectedEngine)
     }
 
     private fun stop() {
